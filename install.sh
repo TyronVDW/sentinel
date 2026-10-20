@@ -4,37 +4,52 @@ set -e
 
 REPO_BASE="https://raw.githubusercontent.com/TyronVDW/sentinel/main"
 SENTINEL_DIR="$HOME/.sentinel"
+BIN_DIR="$HOME/.local/bin"
+OS=$(uname -s)
 
 echo "=== Sentinel ==="
 
-# ── Python 3 ──────────────────────────────────────────────────────────────────
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "Installing Python 3..."
-    if   command -v apt-get >/dev/null 2>&1; then apt-get install -y python3 python3-pip
-    elif command -v apk     >/dev/null 2>&1; then apk add python3 py3-pip
-    elif command -v yum     >/dev/null 2>&1; then yum install -y python3 python3-pip
-    elif command -v brew    >/dev/null 2>&1; then brew install python3
-    else echo "Please install Python 3 manually."; exit 1
-    fi
-fi
-
-# ── dependencies ──────────────────────────────────────────────────────────────
-python3 -m pip install --user --quiet --prefer-binary anthropic 2>/dev/null \
-  || pip3 install --user --quiet --prefer-binary anthropic \
-  || { curl -sSL https://bootstrap.pypa.io/get-pip.py | python3 - --user --quiet; \
-       python3 -m pip install --user --quiet --prefer-binary anthropic; }
-
-# ── download relay ────────────────────────────────────────────────────────────
-mkdir -p "$SENTINEL_DIR"
+mkdir -p "$SENTINEL_DIR" "$BIN_DIR"
 curl -sSL "$REPO_BASE/relay.py" -o "$SENTINEL_DIR/relay.py"
 
-# ── sentinel command ──────────────────────────────────────────────────────────
-BIN_DIR="$HOME/.local/bin"
-mkdir -p "$BIN_DIR"
-cat > "$BIN_DIR/sentinel" << 'EOF'
+if [ "$OS" = "Darwin" ]; then
+    # Try the system Python first — works fine on machines where it's already set up.
+    if command -v python3 >/dev/null 2>&1 \
+       && python3 -m pip install --user --quiet --prefer-binary anthropic >/dev/null 2>&1; then
+        cat > "$BIN_DIR/sentinel" << EOF
 #!/bin/sh
-exec python3 "$HOME/.sentinel/relay.py" "$@"
+exec python3 "$SENTINEL_DIR/relay.py" "\$@"
 EOF
+    else
+        # System Python is unusable (e.g. Xcode license not accepted) — use uv instead.
+        # uv is a static binary: no compiler, no Xcode, just a download.
+        if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+        fi
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+        cat > "$BIN_DIR/sentinel" << EOF
+#!/bin/sh
+export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
+exec uv run --script "$SENTINEL_DIR/relay.py" "\$@"
+EOF
+    fi
+else
+    # Linux / iSH — no Xcode concerns here.
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Installing Python 3..."
+        if   command -v apt-get >/dev/null 2>&1; then apt-get install -y python3 python3-pip
+        elif command -v apk     >/dev/null 2>&1; then apk add python3 py3-pip
+        elif command -v yum     >/dev/null 2>&1; then yum install -y python3 python3-pip
+        else echo "Please install Python 3 manually."; exit 1
+        fi
+    fi
+    python3 -m pip install --user --quiet --prefer-binary anthropic 2>/dev/null \
+      || pip3 install --user --quiet --prefer-binary anthropic
+    cat > "$BIN_DIR/sentinel" << EOF
+#!/bin/sh
+exec python3 "$SENTINEL_DIR/relay.py" "\$@"
+EOF
+fi
 chmod +x "$BIN_DIR/sentinel"
 
 case ":$PATH:" in
@@ -52,4 +67,4 @@ esac
 
 echo "Done. Starting Sentinel..."
 echo ""
-exec python3 "$SENTINEL_DIR/relay.py"
+exec "$BIN_DIR/sentinel"

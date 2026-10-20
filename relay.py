@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["anthropic"]
+# ///
 """
 Sentinel Relay Client
 Usage: python3 relay.py
