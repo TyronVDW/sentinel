@@ -79,8 +79,18 @@ def get_config() -> dict:
             return cfg
 
     # Ask for password
-    print("Sentinel password: ", end="", flush=True)
-    password = getpass.getpass("")
+    try:
+        password = getpass.getpass("Sentinel password: ")
+    except EOFError:
+        print("\nNo input stream available for the password prompt "
+              "(stdin isn't a terminal). Run 'sentinel' directly in your shell.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not password:
+        print("No password entered.", file=sys.stderr)
+        sys.exit(1)
+
     cfg = unlock(password)
     if not cfg:
         print("Incorrect password.", file=sys.stderr)

@@ -67,4 +67,11 @@ esac
 
 echo "Done. Starting Sentinel..."
 echo ""
-exec "$BIN_DIR/sentinel"
+
+# Rebind stdin to the real terminal — this script's own stdin is the curl pipe,
+# not the keyboard, so without this the password prompt gets no input.
+if [ -t 1 ] && [ -r /dev/tty ]; then
+    exec "$BIN_DIR/sentinel" < /dev/tty
+else
+    exec "$BIN_DIR/sentinel"
+fi
