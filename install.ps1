@@ -1,19 +1,17 @@
 # Sentinel Bootstrap Installer — Windows PowerShell
 $ErrorActionPreference = "Stop"
-$RepoBase   = "https://raw.githubusercontent.com/YOUR_GITHUB/sentinel/main"
+$RepoBase    = "https://raw.githubusercontent.com/TyronVDW/sentinel/main"
 $SentinelDir = "$env:USERPROFILE\.sentinel"
 
-Write-Host "=== Sentinel Installer ===" -ForegroundColor Cyan
+Write-Host "=== Sentinel ===" -ForegroundColor Cyan
 
 # ── Python 3 ──────────────────────────────────────────────────────────────────
 $PyCmd = $null
 foreach ($c in @("python3","python")) {
     if (Get-Command $c -ErrorAction SilentlyContinue) {
-        $v = & $c --version 2>&1
-        if ($v -match "Python 3") { $PyCmd = $c; break }
+        if ((& $c --version 2>&1) -match "Python 3") { $PyCmd = $c; break }
     }
 }
-
 if (-not $PyCmd) {
     Write-Host "Downloading Python 3.11..." -ForegroundColor Yellow
     $ins = "$env:TEMP\python-installer.exe"
@@ -24,43 +22,19 @@ if (-not $PyCmd) {
                 [System.Environment]::GetEnvironmentVariable("Path","Machine")
     $PyCmd = "python"
 }
-Write-Host "Python: $(& $PyCmd --version)" -ForegroundColor Green
 
-# ── anthropic SDK ─────────────────────────────────────────────────────────────
-Write-Host "Installing Anthropic SDK..."
+# ── dependencies ──────────────────────────────────────────────────────────────
+Write-Host "Installing dependencies..."
 & $PyCmd -m pip install --user --quiet anthropic
 
-# ── files ─────────────────────────────────────────────────────────────────────
+# ── download relay ────────────────────────────────────────────────────────────
 New-Item -ItemType Directory -Force -Path $SentinelDir | Out-Null
-
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (Test-Path "$ScriptDir\relay.py") {
-    Copy-Item "$ScriptDir\relay.py"    "$SentinelDir\relay.py"
-    Copy-Item "$ScriptDir\config.json" "$SentinelDir\config.json"
-    Write-Host "Files copied from local directory."
-} else {
-    Write-Host "Downloading from GitHub..."
-    Invoke-WebRequest "$RepoBase/relay.py"    -OutFile "$SentinelDir\relay.py"
-    Invoke-WebRequest "$RepoBase/config.json" -OutFile "$SentinelDir\config.json"
-}
-
-# ── API key ───────────────────────────────────────────────────────────────────
-if (-not $env:ANTHROPIC_API_KEY) {
-    $Key = Read-Host "Enter your Anthropic API key"
-    [System.Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $Key, "User")
-    $env:ANTHROPIC_API_KEY = $Key
-    Write-Host "API key saved to user environment." -ForegroundColor Green
-}
+Invoke-WebRequest "$RepoBase/relay.py" -OutFile "$SentinelDir\relay.py"
 
 # ── sentinel command ──────────────────────────────────────────────────────────
 $BinDir = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-
-$BatPath = "$BinDir\sentinel.bat"
-@"
-@echo off
-$PyCmd "%USERPROFILE%\.sentinel\relay.py" %*
-"@ | Out-File -FilePath $BatPath -Encoding ASCII
+"@echo off`r`n$PyCmd `"%USERPROFILE%\.sentinel\relay.py`" %*" | Out-File -FilePath "$BinDir\sentinel.bat" -Encoding ASCII
 
 $UserPath = [System.Environment]::GetEnvironmentVariable("Path","User")
 if ($UserPath -notlike "*$BinDir*") {
@@ -68,8 +42,6 @@ if ($UserPath -notlike "*$BinDir*") {
     $env:Path += ";$BinDir"
 }
 
-Write-Host ""
-Write-Host "=== Installation complete ===" -ForegroundColor Green
-Write-Host "Run: sentinel"
+Write-Host "Done. Starting Sentinel..." -ForegroundColor Green
 Write-Host ""
 & $PyCmd "$SentinelDir\relay.py"

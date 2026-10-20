@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 Sentinel Relay Client
-Connects local machine to the remote Sentinel managed agent.
 Usage: python3 relay.py
-Requires: ANTHROPIC_API_KEY, config.json in same directory
 """
 import json
 import os
@@ -13,27 +11,88 @@ import platform
 import socket
 import threading
 import time
+import base64
+import getpass
+import hashlib
+import struct
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-MAX_OUTPUT  = 50 * 1024   # 50 KB
+SENTINEL_TOKEN = "W4KF0MDAqvPEoaby3vgWPAW19c1aWIElNBNy5E2Q0uOzQhq9El7o86fi63ZhLtWEYmEEwcAon-HsmOh5kflRJrLDMlXKKrZ6otUCDEPkuHzZLLPqeRZy4PWNRmV8QZZF-nwHeRl8H6ibPNWRp-5mkzbz8ucf6nt8MJQA947vX6sWIca_imFXYFY-q9HLCWoo1w7GPb3obVjQ2m2rSAPtzU4iQUi0Rr5Mm4ZLMCH5DZPeNxO6WyFVflZ3sX21-b6fon5EyVlPTqXYZcGxUt8xvApp_oz018pTrnsu6E-RHGm6lEweUAh6XvkWXzr9iEA8t36hTcOfSE331orhYLrzhGMprnn4fosTVSn9sZRdyQDxC3EtHB_nogk"
+SALT        = b'sentinel_v1_salt'
+MAX_OUTPUT  = 50 * 1024
 BETA        = "managed-agents-2026-04-01"
+ENV_PW_KEY  = "SENTINEL_PASSWORD"
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
+def derive_key(password: str) -> bytes:
+    return hashlib.pbkdf2_hmac('sha256', password.encode(), SALT, 480000)
 
-def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        print("Error: config.json not found — run setup.py first.", file=sys.stderr)
+
+def keystream(key: bytes, iv: bytes, length: int) -> bytes:
+    seed = hashlib.sha256(key + iv).digest()
+    out = b''
+    i = 0
+    while len(out) < length:
+        out += hashlib.sha256(seed + struct.pack('>I', i)).digest()
+        i += 1
+    return out[:length]
+
+
+def unlock(password: str) -> dict:
+    try:
+        pad = SENTINEL_TOKEN + '=' * (-len(SENTINEL_TOKEN) % 4)
+        raw = base64.urlsafe_b64decode(pad)
+        iv, ct = raw[:16], raw[16:]
+        key = derive_key(password)
+        pt = bytes(a ^ b for a, b in zip(ct, keystream(key, iv, len(ct))))
+        return json.loads(pt.decode())
+    except Exception:
+        return None
+
+
+def save_password(password: str):
+    """Persist password to user environment (Windows) or shell profile (Unix)."""
+    if platform.system() == "Windows":
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f'[System.Environment]::SetEnvironmentVariable("SENTINEL_PASSWORD", "{password}", "User")'],
+            capture_output=True
+        )
+    else:
+        for profile in [os.path.expanduser("~/.zshrc"),
+                        os.path.expanduser("~/.bashrc"),
+                        os.path.expanduser("~/.profile")]:
+            if os.path.exists(profile):
+                with open(profile, "a") as f:
+                    f.write(f'\nexport SENTINEL_PASSWORD="{password}"\n')
+                break
+
+
+def get_config() -> dict:
+    password = os.environ.get(ENV_PW_KEY, "")
+    if password:
+        cfg = unlock(password)
+        if cfg:
+            return cfg
+
+    # Ask for password
+    print("Sentinel password: ", end="", flush=True)
+    password = getpass.getpass("")
+    cfg = unlock(password)
+    if not cfg:
+        print("Incorrect password.", file=sys.stderr)
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
 
+    save_password(password)
+    os.environ[ENV_PW_KEY] = password
+    return cfg
+
+
+# ── shell helpers ──────────────────────────────────────────────────────────────
 
 def detect_shell():
     if platform.system() == "Windows":
         try:
-            subprocess.run(["powershell", "-Command", "exit"],
-                           capture_output=True, timeout=5)
+            subprocess.run(["powershell", "-Command", "exit"], capture_output=True, timeout=5)
             return "powershell"
         except Exception:
             return "cmd"
@@ -49,17 +108,13 @@ def run_shell(command, timeout=30):
             args = ["cmd", "/c", command]
         else:
             args = ["sh", "-c", command]
-
-        r = subprocess.run(args, capture_output=True, text=True,
-                           timeout=timeout, errors="replace")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, errors="replace")
         out, err = r.stdout, r.stderr
         trunc = False
         if len(out) > MAX_OUTPUT:
-            out = out[:MAX_OUTPUT] + f"\n[truncated at {MAX_OUTPUT} bytes]"
-            trunc = True
+            out = out[:MAX_OUTPUT] + f"\n[truncated]"; trunc = True
         if len(err) > MAX_OUTPUT:
-            err = err[:MAX_OUTPUT] + f"\n[truncated at {MAX_OUTPUT} bytes]"
-            trunc = True
+            err = err[:MAX_OUTPUT] + f"\n[truncated]"; trunc = True
         return {"stdout": out, "stderr": err, "exit_code": r.returncode, "truncated": trunc}
     except subprocess.TimeoutExpired:
         return {"stdout": "", "stderr": f"Timed out after {timeout}s", "exit_code": -1, "truncated": False}
@@ -72,7 +127,7 @@ def read_file(path):
         with open(path, "r", errors="replace") as f:
             content = f.read()
         if len(content) > MAX_OUTPUT:
-            return {"content": content[:MAX_OUTPUT] + f"\n[truncated]", "truncated": True}
+            return {"content": content[:MAX_OUTPUT] + "\n[truncated]", "truncated": True}
         return {"content": content, "truncated": False}
     except Exception as e:
         return {"error": str(e)}
@@ -89,33 +144,23 @@ def write_file(path, content):
 
 
 def dispatch_tool(name, inp):
-    if name == "run_shell":
-        return json.dumps(run_shell(inp["command"], inp.get("timeout", 30)))
-    if name == "read_file":
-        return json.dumps(read_file(inp["path"]))
-    if name == "write_file":
-        return json.dumps(write_file(inp["path"], inp["content"]))
+    if name == "run_shell":  return json.dumps(run_shell(inp["command"], inp.get("timeout", 30)))
+    if name == "read_file":  return json.dumps(read_file(inp["path"]))
+    if name == "write_file": return json.dumps(write_file(inp["path"], inp["content"]))
     return json.dumps({"error": f"unknown tool: {name}"})
 
 
-# ── main relay ─────────────────────────────────────────────────────────────────
+# ── relay ──────────────────────────────────────────────────────────────────────
 
 class SentinelRelay:
-    def __init__(self):
-        self.cfg = load_config()
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            print("Error: ANTHROPIC_API_KEY not set.", file=sys.stderr)
-            sys.exit(1)
-
-        from anthropic import Anthropic
-        self.client   = Anthropic(api_key=api_key)
-        self.session  = None
+    def __init__(self, cfg):
+        self.cfg      = cfg
         self.hostname = socket.gethostname()
-        self._lock    = threading.Lock()
         self._done    = threading.Event()
 
-    # ── session ────────────────────────────────────────────────────────────────
+        from anthropic import Anthropic
+        self.client  = Anthropic(api_key=cfg["api_key"])
+        self.session = None
 
     def new_session(self):
         self.session = self.client.beta.sessions.create(
@@ -136,16 +181,12 @@ class SentinelRelay:
 
     def send_event(self, events):
         self.client.beta.sessions.events.send(
-            self.session.id,
-            events=events,
+            self.session.id, events=events,
             extra_headers={"anthropic-beta": BETA}
         )
 
     def send_message(self, text):
-        self.send_event([{
-            "type": "user.message",
-            "content": [{"type": "text", "text": text}]
-        }])
+        self.send_event([{"type": "user.message", "content": [{"type": "text", "text": text}]}])
 
     def send_tool_result(self, tool_use_id, result_text):
         self.send_event([{
@@ -154,14 +195,10 @@ class SentinelRelay:
             "content": [{"type": "text", "text": result_text}]
         }])
 
-    # ── stream ─────────────────────────────────────────────────────────────────
-
     def stream_loop(self):
-        """Read SSE events and handle them."""
         try:
             with self.client.beta.sessions.events.stream(
-                self.session.id,
-                extra_headers={"anthropic-beta": BETA}
+                self.session.id, extra_headers={"anthropic-beta": BETA}
             ) as stream:
                 for event in stream:
                     etype = getattr(event, "type", None)
@@ -170,35 +207,30 @@ class SentinelRelay:
                         for block in getattr(event, "content", []):
                             btype = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
                             if btype == "text":
-                                text = getattr(block, "text", None) or (block.get("text","") if isinstance(block, dict) else "")
+                                text = getattr(block, "text", None) or (block.get("text", "") if isinstance(block, dict) else "")
                                 print(text, flush=True)
 
                     elif etype == "agent.text_delta":
                         delta = getattr(event, "delta", None)
-                        text = (delta.get("text","") if isinstance(delta, dict) else getattr(delta,"text","")) if delta else ""
+                        text  = (delta.get("text", "") if isinstance(delta, dict) else getattr(delta, "text", "")) if delta else ""
                         print(text, end="", flush=True)
 
-                    elif etype == "agent.text":
-                        print(getattr(event, "text", ""), end="", flush=True)
-
                     elif etype == "agent.custom_tool_use":
-                        tid   = getattr(event, "id", None)
-                        tname = getattr(event, "name", "")
-                        tinp  = getattr(event, "input", {})
+                        tid    = getattr(event, "id", None)
+                        tname  = getattr(event, "name", "")
+                        tinp   = getattr(event, "input", {})
                         result = dispatch_tool(tname, tinp if isinstance(tinp, dict) else {})
                         try:
                             self.send_tool_result(tid, result)
                         except Exception as e:
-                            print(f"\n[relay error sending tool result: {e}]", file=sys.stderr)
+                            print(f"\n[relay error: {e}]", file=sys.stderr)
 
                     elif etype in ("session.status_idle", "session.thread_status_idle"):
-                        pass  # idle — ready for next input
+                        pass
 
         except Exception as e:
             if not self._done.is_set():
-                print(f"\n[stream disconnected: {e}]", file=sys.stderr)
-
-    # ── stdin reader ───────────────────────────────────────────────────────────
+                print(f"\n[stream error: {e}]", file=sys.stderr)
 
     def stdin_loop(self):
         try:
@@ -214,31 +246,20 @@ class SentinelRelay:
         finally:
             self._done.set()
 
-    # ── run ────────────────────────────────────────────────────────────────────
-
     def run(self):
         self.new_session()
-
-        # Start SSE stream thread first
         t_stream = threading.Thread(target=self.stream_loop, daemon=True)
         t_stream.start()
-
-        # Tiny pause to let stream connect
         time.sleep(0.3)
-
-        # Trigger greeting
         self.send_message("hello")
-
-        # Start stdin reader
         t_stdin = threading.Thread(target=self.stdin_loop, daemon=True)
         t_stdin.start()
-
-        # Wait until stdin closes or stream dies
         self._done.wait()
 
 
 def main():
-    relay = SentinelRelay()
+    cfg = get_config()
+    relay = SentinelRelay(cfg)
     relay.run()
 
 
