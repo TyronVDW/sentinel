@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["anthropic"]
+# dependencies = ["anthropic", "websocket-client"]
 # ///
 """
 Sentinel Relay Client
@@ -19,12 +19,24 @@ import base64
 import getpass
 import hashlib
 import struct
+from urllib.parse import quote
+
+try:
+    import websocket  # websocket-client (optional; hub features disabled if missing)
+except Exception:
+    websocket = None
 
 SENTINEL_TOKEN = "VCgM03D-YI-Tn_s1-ZjhgDzEpgdbajHECIdslBgU-fIzhpEgOXl5gmXCwQ3zmkGqwC3CLzgGJMLChYTy-O3aYgfngyF-XrE1ABZiBiDWBiBtpO2c1zP-ir2rrmUfZ3nAs3bBw7nctjb_KPzrkxalsRWjS2fMEwDpZPBH29-WHBgCWCJ-lmdkjJ1ZViymU1jLHO3zU6rJ0xYzhe7xNbWr-jVvz-kiac6qcZjGmQxpPm_AEQG1txXw6YKJWfekr8sXK-7Y7hQ0Qm5JVEKMnu8B0M1bz103BbJHt4u2j1sihjB71EJMaomal6SvZm3xIIsv1HdLADjP4hrfJEKbo0JPUjsji0h6BC0lRt0TF9w8JW28Nmle6PsClRI"
 SALT        = b'sentinel_v1_salt'
+HUB_SALT    = "sentinel_hub_v1"
 MAX_OUTPUT  = 50 * 1024
 BETA        = "managed-agents-2026-04-01"
 ENV_PW_KEY  = "SENTINEL_PASSWORD"
+
+# Cloudflare hub. Leave blank to run purely local (terminal only).
+# After deploying the hub, set this to  wss://<your-worker>.workers.dev/ws
+# or export SENTINEL_HUB_URL to override without editing this file.
+HUB_URL = "wss://sentinel-hub.tyvdw.workers.dev/ws"
 
 
 def derive_key(password: str) -> bytes:
@@ -53,6 +65,12 @@ def unlock(password: str) -> dict:
         return None
 
 
+def derive_hub_token(password: str) -> str:
+    """Token the hub checks. Matches the dashboard's SHA-256(password+salt)."""
+    d = hashlib.sha256((password + HUB_SALT).encode()).digest()
+    return base64.urlsafe_b64encode(d).rstrip(b'=').decode()
+
+
 def save_password(password: str):
     """Persist password to user environment (Windows) or shell profile (Unix)."""
     if platform.system() == "Windows":
@@ -76,9 +94,9 @@ def get_config() -> dict:
     if password:
         cfg = unlock(password)
         if cfg:
+            cfg["_password"] = password
             return cfg
 
-    # Ask for password
     try:
         password = getpass.getpass("Sentinel password: ")
     except EOFError:
@@ -98,6 +116,7 @@ def get_config() -> dict:
 
     save_password(password)
     os.environ[ENV_PW_KEY] = password
+    cfg["_password"] = password
     return cfg
 
 
@@ -164,6 +183,72 @@ def dispatch_tool(name, inp):
     return json.dumps({"error": f"unknown tool: {name}"})
 
 
+# ── hub client (optional) ────────────────────────────────────────────────────────
+
+class HubClient:
+    """Keeps a WebSocket to the Cloudflare hub. Reconnects forever.
+    Forwards agent output up; delivers dashboard messages via on_text."""
+
+    def __init__(self, url, on_text):
+        self.url = url
+        self.on_text = on_text
+        self.ws = None
+        self._connected = False
+        self._stop = False
+
+    def _on_open(self, ws):
+        self._connected = True
+
+    def _on_close(self, ws, *a):
+        self._connected = False
+
+    def _on_error(self, ws, err):
+        self._connected = False
+
+    def _on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+        except Exception:
+            return
+        if data.get("type") == "message":
+            txt = data.get("text", "")
+            if txt and self.on_text:
+                try:
+                    self.on_text(txt)
+                except Exception:
+                    pass
+
+    def run_forever(self):
+        while not self._stop:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_close=self._on_close,
+                    on_error=self._on_error,
+                )
+                self.ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception:
+                pass
+            self._connected = False
+            if self._stop:
+                break
+            time.sleep(5)
+
+    def send(self, obj):
+        if not self._connected or not self.ws:
+            return
+        try:
+            self.ws.send(json.dumps(obj))
+        except Exception:
+            self._connected = False
+
+    def send_output(self, text):
+        if text:
+            self.send({"type": "output", "text": text})
+
+
 # ── relay ──────────────────────────────────────────────────────────────────────
 
 class SentinelRelay:
@@ -175,6 +260,22 @@ class SentinelRelay:
         from anthropic import Anthropic
         self.client  = Anthropic(api_key=cfg["api_key"])
         self.session = None
+
+        # Optional hub
+        self.hub = None
+        hub_url = os.environ.get("SENTINEL_HUB_URL", HUB_URL).strip()
+        password = cfg.get("_password", "")
+        if hub_url and password and websocket is not None:
+            os_name = f"{platform.system()} {platform.release()}".strip()
+            token = derive_hub_token(password)
+            full = (f"{hub_url}?role=relay"
+                    f"&machine={quote(self.hostname)}"
+                    f"&os={quote(os_name)}"
+                    f"&token={quote(token)}")
+            self.hub = HubClient(full, on_text=self._on_hub_message)
+
+    def _on_hub_message(self, text):
+        self.send_message(text)
 
     def new_session(self):
         self.session = self.client.beta.sessions.create(
@@ -209,6 +310,12 @@ class SentinelRelay:
             "content": [{"type": "text", "text": result_text}]
         }])
 
+    def emit(self, text, end="\n"):
+        """Print locally and mirror to the hub."""
+        print(text, end=end, flush=True)
+        if self.hub:
+            self.hub.send_output(text)
+
     def stream_loop(self):
         try:
             with self.client.beta.sessions.events.stream(
@@ -222,7 +329,7 @@ class SentinelRelay:
                             btype = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
                             if btype == "text":
                                 text = getattr(block, "text", None) or (block.get("text", "") if isinstance(block, dict) else "")
-                                print(text, flush=True)
+                                self.emit(text)
 
                     elif etype == "agent.text_delta":
                         delta = getattr(event, "delta", None)
@@ -233,7 +340,10 @@ class SentinelRelay:
                         tid    = getattr(event, "id", None)
                         tname  = getattr(event, "name", "")
                         tinp   = getattr(event, "input", {})
-                        result = dispatch_tool(tname, tinp if isinstance(tinp, dict) else {})
+                        tinp   = tinp if isinstance(tinp, dict) else {}
+                        if self.hub and tname == "run_shell" and tinp.get("command"):
+                            self.hub.send_output(">> " + str(tinp["command"]))
+                        result = dispatch_tool(tname, tinp)
                         try:
                             self.send_tool_result(tid, result)
                         except Exception as e:
@@ -258,17 +368,35 @@ class SentinelRelay:
         except Exception:
             pass
         finally:
-            self._done.set()
+            # With a hub attached the relay stays up (driven from the web) even
+            # when there is no local terminal; only local-only mode exits on EOF.
+            if not self.hub:
+                self._done.set()
 
     def run(self):
-        self.new_session()
-        t_stream = threading.Thread(target=self.stream_loop, daemon=True)
-        t_stream.start()
-        time.sleep(0.3)
-        self.send_message("hello")
-        t_stdin = threading.Thread(target=self.stdin_loop, daemon=True)
-        t_stdin.start()
-        self._done.wait()
+        if self.hub:
+            threading.Thread(target=self.hub.run_forever, daemon=True).start()
+        threading.Thread(target=self.stdin_loop, daemon=True).start()
+
+        # Supervisor: keep a live session. If the event stream ends or errors
+        # (network blip, idle timeout), re-establish it rather than sitting
+        # "online" but unresponsive. The hub connection is independent and
+        # stays up across these reconnects, so the dashboard keeps showing the
+        # machine as online.
+        first = True
+        while not self._done.is_set():
+            try:
+                self.new_session()
+                if first:
+                    time.sleep(0.3)
+                    self.send_message("hello")
+                    first = False
+                self.stream_loop()  # blocks until the event stream ends/errors
+            except Exception as e:
+                print(f"\n[session error: {e}]", file=sys.stderr)
+            if self._done.is_set():
+                break
+            time.sleep(10)  # backoff, then re-establish the session
 
 
 def main():
